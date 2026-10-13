@@ -1,0 +1,86 @@
+name: Workspace Windows validation
+run-name: Windows ${{ inputs.source_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit in this fork to build
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Validate revision
+        shell: pwsh
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'A full commit SHA is required' }
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Record source and toolchain
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:SOURCE_SHA) { throw 'Source revision mismatch' }
+          $actual | Out-File evidence/source-sha.txt
+          cmake --version | Out-File evidence/toolchain.txt
+          rustc --version | Out-File -Append evidence/toolchain.txt
+          'Windows/MSVC compilation and synthetic tests only. No game installation or gameplay test.' | Out-File evidence/scope.txt
+      - name: Fetch pinned Rust dependencies before CMake
+        shell: pwsh
+        run: |
+          # Runtime.cmake locates windows.0.52.0.lib in Cargo's registry at configure time.
+          if (Test-Path SpotifyHelper/Cargo.toml) {
+            cargo fetch --locked --manifest-path SpotifyHelper/Cargo.toml 2>&1 | Tee-Object evidence/cargo-fetch.log
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Configure
+        shell: pwsh
+        run: |
+          $flags = @('-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF', '-DDINGOSDK_CRASH_REPORT_URL=')
+          $files = @('CMakeLists.txt') + @(Get-ChildItem cmake -Filter '*.cmake' | ForEach-Object { $_.FullName })
+          $options = foreach ($file in $files) {
+            [regex]::Matches((Get-Content -Raw $file), 'option\((DINGOSDK_BUILD_[A-Z_]+)') | ForEach-Object { $_.Groups[1].Value }
+          }
+          $flags += @($options | Sort-Object -Unique | ForEach-Object { "-D$_=ON" })
+          $flags | Out-File evidence/configure-flags.txt
+          cmake --preset vs2022-x64 @flags 2>&1 | Tee-Object evidence/configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build --preset release --parallel 4 2>&1 | Tee-Object evidence/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test without game data
+        shell: pwsh
+        run: |
+          # These tests read proprietary installed game data and require a local run.
+          'Excluded: hall_of_meat_skeleton, game_textures, trainer_tuning_names, physics_tuning, park_editor_ui, launcher_archives, launcher_mod_merge' | Out-File evidence/game-data-tests.txt
+          ctest --test-dir build/vs2022-x64 -C Release --output-on-failure --no-tests=error --timeout 120 --output-junit "$pwd/evidence/tests.xml" -E '^(hall_of_meat_skeleton|game_textures|trainer_tuning_names|physics_tuning|park_editor_ui|launcher_archives|launcher_mod_merge)$' 2>&1 | Tee-Object evidence/tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Hash built binaries
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path build/vs2022-x64/Release) {
+            Get-ChildItem build/vs2022-x64/Release -File | Where-Object { $_.Name -like 'ReSkate*' } | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash | ConvertTo-Json | Out-File evidence/sha256.json
+          }
+      - name: Upload build evidence and binaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-${{ inputs.source_sha }}
+          retention-days: 14
+          path: |
+            evidence/
+            build/vs2022-x64/Release/ReSkate*.exe
+            build/vs2022-x64/Release/ReSkate.dll
