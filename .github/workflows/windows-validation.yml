@@ -7,6 +7,14 @@ on:
         description: Full 40-character commit in this fork to build
         required: true
         type: string
+      build_scope:
+        description: Full shipping build or registered tests only
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - tests
 permissions:
   contents: read
 jobs:
@@ -15,6 +23,7 @@ jobs:
     timeout-minutes: 60
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
+      BUILD_SCOPE: ${{ inputs.build_scope }}
     steps:
       - name: Validate revision
         shell: pwsh
@@ -46,6 +55,8 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force build/vs2022-x64/.cmake/api/v1/query | Out-Null
+          New-Item -ItemType File -Force build/vs2022-x64/.cmake/api/v1/query/codemodel-v2 | Out-Null
           $flags = @('-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF', '-DDINGOSDK_CRASH_REPORT_URL=')
           $files = @('CMakeLists.txt') + @(Get-ChildItem cmake -Filter '*.cmake' | ForEach-Object { $_.FullName })
           $options = foreach ($file in $files) {
@@ -58,14 +69,45 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build --preset release --parallel 4 2>&1 | Tee-Object evidence/build.log
+          # Build shipping programs and actual CTest executables. Upstream's ALL
+          # target also includes manual audio probes with incomplete link wiring.
+          $reply = 'build/vs2022-x64/.cmake/api/v1/reply'
+          $index = Get-ChildItem "$reply/index-*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $modelFile = (Get-Content -Raw $index.FullName | ConvertFrom-Json).reply.'codemodel-v2'.jsonFile
+          $model = Get-Content -Raw "$reply/$modelFile" | ConvertFrom-Json
+          $release = $model.configurations | Where-Object { $_.name -eq 'Release' }
+          $registered = @{}
+          Get-ChildItem build/vs2022-x64 -Recurse -Filter CTestTestfile.cmake | ForEach-Object {
+            [regex]::Matches((Get-Content -Raw $_.FullName), 'add_test\([^\r\n]*?"[^"\r\n]*[/\\]([^/\\"]+\.exe)"') | ForEach-Object { $registered[$_.Groups[1].Value] = $true }
+          }
+          if ($registered.Count -eq 0) { throw 'No registered test executables found' }
+          $targets = @()
+          $omitted = @()
+          foreach ($entry in $release.targets) {
+            $target = Get-Content -Raw "$reply/$($entry.jsonFile)" | ConvertFrom-Json
+            $test = @($target.artifacts | Where-Object { $registered.ContainsKey([IO.Path]::GetFileName($_.path)) }).Count -gt 0
+            $shipping = $env:BUILD_SCOPE -eq 'full' -and $target.name -in @('dingosdk_runtime','dingosdk_launcher','dingosdk_server','dingosdk_emote_packer')
+            if ($test -or $shipping) { $targets += $target.name }
+            elseif ($target.type -eq 'EXECUTABLE') { $omitted += $target.name }
+          }
+          $targets | Sort-Object -Unique | Out-File evidence/build-targets.txt
+          $omitted | Sort-Object -Unique | Out-File evidence/unregistered-programs-not-built.txt
+          $env:BUILD_SCOPE | Out-File evidence/build-scope.txt
+          cmake --build --preset release --parallel 4 --target @targets 2>&1 | Tee-Object evidence/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test without game data
         shell: pwsh
         run: |
-          # These tests read proprietary installed game data and require a local run.
-          'Excluded: hall_of_meat_skeleton, game_textures, trainer_tuning_names, physics_tuning, park_editor_ui, launcher_archives, launcher_mod_merge' | Out-File evidence/game-data-tests.txt
-          ctest --test-dir build/vs2022-x64 -C Release --output-on-failure --no-tests=error --timeout 120 --output-junit "$pwd/evidence/tests.xml" -E '^(hall_of_meat_skeleton|game_textures|trainer_tuning_names|physics_tuning|park_editor_ui|launcher_archives|launcher_mod_merge)$' 2>&1 | Tee-Object evidence/tests.log
+          # Exclude game-data registrations explicitly: some otherwise return 0
+          # after printing "skipped", which is not a real integration-test pass.
+          $gameTests = @()
+          $files = @('CMakeLists.txt') + @(Get-ChildItem cmake -Filter '*.cmake' | ForEach-Object { $_.FullName })
+          foreach ($file in $files) {
+            $gameTests += @([regex]::Matches((Get-Content -Raw $file), 'add_test\(NAME\s+([A-Za-z0-9_]+)\s+COMMAND[^\r\n]*DINGOSDK_TEST_GAME_ROOT') | ForEach-Object { $_.Groups[1].Value })
+          }
+          $gameTests | Sort-Object -Unique | Out-File evidence/game-data-tests.txt
+          $exclude = if ($gameTests.Count) { '^(' + (($gameTests | Sort-Object -Unique) -join '|') + ')$' } else { '^$' }
+          ctest --test-dir build/vs2022-x64 -C Release --output-on-failure --no-tests=error --timeout 120 --output-junit "$pwd/evidence/tests.xml" -E $exclude 2>&1 | Tee-Object evidence/tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Hash built binaries
         if: always()
