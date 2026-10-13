@@ -106,7 +106,12 @@ jobs:
             $gameTests += @([regex]::Matches((Get-Content -Raw $file), 'add_test\(NAME\s+([A-Za-z0-9_]+)\s+COMMAND[^\r\n]*DINGOSDK_TEST_GAME_ROOT') | ForEach-Object { $_.Groups[1].Value })
           }
           $gameTests | Sort-Object -Unique | Out-File evidence/game-data-tests.txt
-          $exclude = if ($gameTests.Count) { '^(' + (($gameTests | Sort-Object -Unique) -join '|') + ')$' } else { '^$' }
+          # These registrations also return success without doing work unless
+          # given an installed content cache, game/mod data or a scratch save.
+          $fixtureTests = @('content_catalogs','content_cache_install','bundle_ref_table','profile_migration')
+          $fixtureTests | Out-File evidence/fixture-tests.txt
+          $excluded = @($gameTests) + $fixtureTests
+          $exclude = '^(' + (($excluded | Sort-Object -Unique) -join '|') + ')$'
           ctest --test-dir build/vs2022-x64 -C Release --output-on-failure --no-tests=error --timeout 120 --output-junit "$pwd/evidence/tests.xml" -E $exclude 2>&1 | Tee-Object evidence/tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Hash built binaries
